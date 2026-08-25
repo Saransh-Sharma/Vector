@@ -7,7 +7,7 @@ Vector is a local-first control plane for agent harnesses. It resolves a reposit
 - Layered `vector.dev/v1alpha1` workspace configuration with field provenance.
 - Monotonic `deny > prompt > allow` capability policy and explicit YOLO grants.
 - Canonical, BLAKE3-addressed `PortableRunSpec` values.
-- LM Studio and Ollama discovery, including exact model IDs.
+- LM Studio and Ollama discovery, including exact model IDs. For loopback LM Studio endpoints, Vector uses the official `lms` CLI to start a stopped local API server automatically.
 - Native plan compilation for OMP, Pi RPC, and DeepSeek Harness preview.
 - Append-only run ledgers with a rebuildable SQLite read model.
 - Authenticated, newline-delimited local IPC for `vectord` on Unix systems.
@@ -47,4 +47,3 @@ This repository implements the first executable vertical slice of the full Vecto
 ## License
 
 MIT
-

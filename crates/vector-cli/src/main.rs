@@ -186,7 +186,10 @@ async fn main() -> Result<()> {
 
 async fn init(root: &Path, args: InitArgs, json_output: bool) -> Result<()> {
     let discovery = ProviderDiscovery::new()?;
-    let lm = discovery.lm_studio("http://127.0.0.1:1234/v1").await.context("VCTR_PROVIDER_UNAVAILABLE: LM Studio was not reachable at 127.0.0.1:1234. Start its local server, then retry")?;
+    let lm = discovery
+        .ensure_lm_studio("http://127.0.0.1:1234/v1")
+        .await
+        .context("VCTR_PROVIDER_UNAVAILABLE: LM Studio discovery and automatic startup failed")?;
     if lm.models.is_empty() {
         bail!("VCTR_MODEL_UNAVAILABLE: LM Studio returned no loaded models");
     }
@@ -364,7 +367,9 @@ async fn harness(root: &Path, command: HarnessCommands, json_output: bool) -> Re
 async fn provider(command: ProviderCommands, json_output: bool) -> Result<()> {
     match command {
         ProviderCommands::Discover { endpoint } => {
-            let provider = ProviderDiscovery::new()?.lm_studio(&endpoint).await?;
+            let provider = ProviderDiscovery::new()?
+                .ensure_lm_studio(&endpoint)
+                .await?;
             if json_output {
                 print_json(json!(provider));
             } else {

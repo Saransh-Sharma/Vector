@@ -3,8 +3,13 @@
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::time::Duration;
+use std::{
+    path::{Path, PathBuf},
+    process::Stdio,
+    time::Duration,
+};
 use thiserror::Error;
+use tokio::{process::Command, time::sleep};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -75,6 +80,61 @@ impl ProviderDiscovery {
         })
     }
 
+    /// Discover LM Studio and, for loopback endpoints only, start its local API
+    /// server through the official `lms` CLI when it is installed but stopped.
+    pub async fn ensure_lm_studio(
+        &self,
+        base_url: &str,
+    ) -> Result<DiscoveredProvider, ProviderError> {
+        match self.lm_studio(base_url).await {
+            Ok(provider) => return Ok(provider),
+            Err(error) if !is_loopback_endpoint(base_url)? => return Err(error),
+            Err(_) => {}
+        }
+
+        let cli = find_lms_cli().ok_or(ProviderError::LmStudioCliUnavailable)?;
+        let port = endpoint_port(base_url)?;
+        let output = Command::new(&cli)
+            .args([
+                "server",
+                "start",
+                "--port",
+                &port.to_string(),
+                "--bind",
+                "127.0.0.1",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .await
+            .map_err(|error| ProviderError::LmStudioStartFailed(error.to_string()))?;
+
+        if !output.status.success() {
+            let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(ProviderError::LmStudioStartFailed(if detail.is_empty() {
+                format!("lms exited with {}", output.status)
+            } else {
+                detail
+            }));
+        }
+
+        // `lms server start` normally returns only after binding, but the retry
+        // window also covers slower first starts and desktop IPC initialization.
+        for _ in 0..40 {
+            if let Ok(mut provider) = self.lm_studio(base_url).await {
+                provider.note = Some(format!(
+                    "Vector started LM Studio's loopback server with {}",
+                    cli.display()
+                ));
+                return Ok(provider);
+            }
+            sleep(Duration::from_millis(250)).await;
+        }
+
+        Err(ProviderError::LmStudioStartTimedOut { port })
+    }
+
     pub async fn ollama(&self, endpoint: &str) -> Result<DiscoveredProvider, ProviderError> {
         let base = Url::parse(endpoint)
             .map_err(|error| ProviderError::InvalidEndpoint(error.to_string()))?;
@@ -123,6 +183,55 @@ fn normalize_openai_base(value: &str) -> Result<Url, ProviderError> {
     Url::parse(&value).map_err(|error| ProviderError::InvalidEndpoint(error.to_string()))
 }
 
+fn endpoint_port(value: &str) -> Result<u16, ProviderError> {
+    Ok(normalize_openai_base(value)?
+        .port_or_known_default()
+        .unwrap_or(1234))
+}
+
+fn is_loopback_endpoint(value: &str) -> Result<bool, ProviderError> {
+    let endpoint = normalize_openai_base(value)?;
+    let Some(host) = endpoint.host_str() else {
+        return Ok(false);
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    Ok(host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback()))
+}
+
+fn find_lms_cli() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("LMS_CLI_PATH").map(PathBuf::from)
+        && executable_file(&path)
+    {
+        return Some(path);
+    }
+
+    let executable = if cfg!(windows) { "lms.exe" } else { "lms" };
+    if let Some(path) = std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .map(|path| path.join(executable))
+            .find(|path| executable_file(path))
+    }) {
+        return Some(path);
+    }
+
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)?;
+    [
+        home.join(".lmstudio/bin").join(executable),
+        home.join(".local/bin").join(executable),
+    ]
+    .into_iter()
+    .find(|path| executable_file(path))
+}
+
+fn executable_file(path: &Path) -> bool {
+    path.metadata().is_ok_and(|metadata| metadata.is_file())
+}
+
 fn infer_vision(extra: &serde_json::Map<String, Value>) -> Option<bool> {
     extra
         .get("capabilities")
@@ -162,6 +271,16 @@ pub enum ProviderError {
     Request(#[from] reqwest::Error),
     #[error("VCTR_PROVIDER_UNAVAILABLE: invalid endpoint: {0}")]
     InvalidEndpoint(String),
+    #[error(
+        "VCTR_LM_STUDIO_CLI_UNAVAILABLE: LM Studio is not reachable and its `lms` CLI was not found. Install the LM Studio CLI from the app's Developer tab."
+    )]
+    LmStudioCliUnavailable,
+    #[error("VCTR_LM_STUDIO_START_FAILED: the LM Studio server could not be started: {0}")]
+    LmStudioStartFailed(String),
+    #[error(
+        "VCTR_LM_STUDIO_START_TIMEOUT: LM Studio did not become healthy on loopback port {port} within 10 seconds"
+    )]
+    LmStudioStartTimedOut { port: u16 },
 }
 
 #[cfg(test)]
@@ -182,5 +301,18 @@ mod tests {
                 .as_str(),
             "http://localhost:1234/v1/"
         );
+    }
+
+    #[test]
+    fn autostart_is_restricted_to_loopback() {
+        assert!(is_loopback_endpoint("http://127.0.0.1:1234/v1").unwrap());
+        assert!(is_loopback_endpoint("http://localhost:1234").unwrap());
+        assert!(is_loopback_endpoint("http://[::1]:1234/v1").unwrap());
+        assert!(!is_loopback_endpoint("https://models.example.com/v1").unwrap());
+    }
+
+    #[test]
+    fn preserves_the_configured_port() {
+        assert_eq!(endpoint_port("http://127.0.0.1:54321/v1").unwrap(), 54321);
     }
 }

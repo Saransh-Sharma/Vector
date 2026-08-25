@@ -79,7 +79,7 @@ fn initialize_workspace(input: InitializeInput) -> Result<InitializeResult, Stri
 async fn discover_lm_studio(endpoint: String) -> Result<DiscoveredProvider, String> {
     ProviderDiscovery::new()
         .map_err(|error| error.to_string())?
-        .lm_studio(&endpoint)
+        .ensure_lm_studio(&endpoint)
         .await
         .map_err(|error| error.to_string())
 }
