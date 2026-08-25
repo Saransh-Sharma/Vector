@@ -35,8 +35,11 @@ const browserFallback: SystemSnapshot = {
 };
 
 export async function systemSnapshot(): Promise<SystemSnapshot> {
-  try { return await invoke<SystemSnapshot>("system_snapshot"); }
-  catch { return browserFallback; }
+  if ("__TAURI_INTERNALS__" in window) {
+    return invoke<SystemSnapshot>("system_snapshot");
+  }
+  const response = await fetch("/__vector/system");
+  return response.ok ? response.json() as Promise<SystemSnapshot> : browserFallback;
 }
 
 export async function discoverLmStudio(endpoint = "http://127.0.0.1:1234/v1"): Promise<ProviderSnapshot> {
@@ -77,5 +80,17 @@ export async function initializeWorkspace(input: {
   computerUse: boolean;
   harness: "pi" | "omp" | "deepseek";
 }) {
-  return invoke<{ path: string; defaultProfile: string }>("initialize_workspace", { input });
+  if ("__TAURI_INTERNALS__" in window) {
+    return invoke<{ path: string; defaultProfile: string }>("initialize_workspace", { input });
+  }
+  const response = await fetch("/__vector/initialize", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(input),
+  });
+  const result = await response.json().catch(() => undefined) as { path?: string; defaultProfile?: string; error?: string } | undefined;
+  if (!response.ok || !result?.path || !result.defaultProfile) {
+    throw new Error(result?.error ?? `Vector initialization returned HTTP ${response.status}`);
+  }
+  return { path: result.path, defaultProfile: result.defaultProfile };
 }

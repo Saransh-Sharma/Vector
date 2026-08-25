@@ -82,6 +82,8 @@ struct InitArgs {
     computer_use: bool,
     #[arg(long)]
     non_interactive: bool,
+    #[arg(long, value_enum, default_value = "pi")]
+    harness: HarnessArg,
 }
 
 #[derive(Args)]
@@ -242,14 +244,20 @@ async fn init(root: &Path, args: InitArgs, json_output: bool) -> Result<()> {
             "VCTR_CAPABILITY_UNSATISFIED: computer use needs a model that LM Studio reports as vision-capable, or --vision-model"
         );
     }
-    let config = starter_workspace(&model, vision.as_deref(), computer);
+    let mut config = starter_workspace(&model, vision.as_deref(), computer);
+    let default_profile = match args.harness {
+        HarnessArg::Omp => "omp-safe",
+        HarnessArg::Pi => "pi-safe",
+        HarnessArg::Deepseek => "deepseek-preview",
+    };
+    config.default_profile = Some(default_profile.into());
     let path = write_workspace_atomic(root, &config)?;
-    let output = json!({"configured":true,"path":path,"provider":lm,"defaultProfile":"pi-safe","computerUse":computer});
+    let output = json!({"configured":true,"path":path,"provider":lm,"defaultProfile":default_profile,"computerUse":computer});
     if json_output {
         print_json(output);
     } else {
         println!(
-            "Vector is ready.\n\n  Model: {model}\n  Profile: pi-safe\n  Config: {}\n\nNext: vctr resolve --explain",
+            "Vector is ready.\n\n  Model: {model}\n  Profile: {default_profile}\n  Config: {}\n\nNext: vctr resolve --explain",
             path.display()
         );
     }
