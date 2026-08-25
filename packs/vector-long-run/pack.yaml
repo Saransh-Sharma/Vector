@@ -1,0 +1,13 @@
+apiVersion: vector.dev/v1alpha1
+kind: VectorPack
+metadata:
+  id: vector/long-run
+  version: 0.1.0
+  license: MIT
+trustTier: 0
+lazy: true
+checkpoints:
+  onCompaction: true
+  onVerification: true
+  portableSummary: true
+

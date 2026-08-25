@@ -1,0 +1,11 @@
+apiVersion: vector.dev/v1alpha1
+kind: VectorPack
+metadata:
+  id: vector/lazypi-curated
+  version: 0.1.0
+  license: MIT
+  description: Reviewed LazyPi catalog entries only; no package is installed implicitly.
+trustTier: 0
+lazy: true
+sources: []
+

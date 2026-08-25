@@ -1,0 +1,16 @@
+apiVersion: vector.dev/v1alpha1
+kind: VectorPack
+metadata:
+  id: vector/coding
+  version: 0.1.0
+  license: MIT
+trustTier: 0
+lazy: true
+capabilities:
+  code.search: allow
+  code.lsp: allow
+  git.read: allow
+  git.write: prompt
+verification:
+  requireDiffReview: true
+

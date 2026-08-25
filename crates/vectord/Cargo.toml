@@ -1,0 +1,21 @@
+[package]
+name = "vectord"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+blake3.workspace = true
+clap.workspace = true
+directories.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+vector-core = { path = "../vector-core" }
+vector-db = { path = "../vector-db" }
+vector-harness = { path = "../vector-harness" }
+vector-providers = { path = "../vector-providers" }
+

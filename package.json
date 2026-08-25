@@ -1,0 +1,20 @@
+{
+  "name": "vector-agentic-harness",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "apps/desktop",
+    "packages/*",
+    "extensions/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspace @vector/desktop",
+    "dev": "npm run dev --workspace @vector/desktop",
+    "check": "cargo test --workspace && npm run build",
+    "schema": "cargo run -p vector-agent -- schema"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  }
+}
+

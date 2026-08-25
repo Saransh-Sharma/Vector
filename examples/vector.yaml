@@ -1,0 +1,31 @@
+apiVersion: vector.dev/v1alpha1
+kind: VectorWorkspace
+trust: untrusted
+defaultProfile: pi-safe
+providers:
+  lm-studio:
+    kind: lm-studio
+    baseUrl: http://127.0.0.1:1234/v1
+    local: true
+profiles:
+  pi-safe:
+    harness: pi
+    provider: lm-studio
+    models:
+      primary: replace-with-the-exact-id-from-vctr-provider-discover
+    isolation:
+      kind: workspace-sandbox
+      network: provider-only
+    policy:
+      filesystem.workspace-write: allow
+      filesystem.external-write: deny
+      process.execute: prompt
+      git.push: prompt
+    packs:
+      - id: vector/base
+        source: builtin
+      - id: vector/local-lean
+        source: builtin
+        lazy: true
+    yolo: false
+

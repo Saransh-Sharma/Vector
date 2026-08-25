@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://vector.dev/schemas/computer-use/v1alpha1",
+  "title": "Vector computer-use request",
+  "type": "object",
+  "required": ["protocolVersion", "id", "grant", "action"],
+  "additionalProperties": false,
+  "properties": {
+    "protocolVersion": { "const": "1.0" },
+    "id": { "type": "string", "format": "uuid" },
+    "grant": { "type": "string", "minLength": 32 },
+    "action": { "enum": ["status", "request-permissions", "inspect-windows", "screenshot", "click", "type", "key", "scroll", "wait", "focus"] },
+    "params": { "type": "object" }
+  }
+}
+

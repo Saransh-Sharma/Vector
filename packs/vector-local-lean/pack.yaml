@@ -1,0 +1,13 @@
+apiVersion: vector.dev/v1alpha1
+kind: VectorPack
+metadata:
+  id: vector/local-lean
+  version: 0.1.0
+  license: MIT
+trustTier: 0
+lazy: true
+context:
+  stablePrefix: true
+  lazyResources: true
+  spillLargeToolResults: true
+

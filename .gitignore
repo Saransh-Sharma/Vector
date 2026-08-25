@@ -1,0 +1,16 @@
+/target
+/node_modules
+**/.build/
+/.DS_Store
+*.log
+*.tsbuildinfo
+.env
+.env.*
+!.env.example
+.vector/local.yaml
+.vector/generated/
+.vector/runs/
+apps/desktop/dist/
+apps/desktop/vite.config.js
+apps/desktop/vite.config.d.ts
+apps/desktop/src-tauri/gen/

@@ -1,0 +1,14 @@
+apiVersion: vector.dev/v1alpha1
+kind: VectorPack
+metadata:
+  id: vector/base
+  version: 0.1.0
+  license: MIT
+trustTier: 0
+resources:
+  instructions:
+    - instructions.md
+capabilities:
+  filesystem.read: allow
+  session.export: allow
+

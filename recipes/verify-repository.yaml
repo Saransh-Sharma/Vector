@@ -1,0 +1,22 @@
+apiVersion: vector.dev/v1alpha1
+kind: VectorRecipe
+metadata:
+  id: vector/verify-repository
+  version: 0.1.0
+inputs:
+  phase:
+    type: string
+    enum: [quick, afterChange, beforeComplete]
+steps:
+  - id: resolve-verification
+    type: vector.resolveVerification
+  - id: execute
+    type: process.argv
+    isolation: workspace-sandbox
+    policy:
+      process.execute: allow
+      filesystem.external-write: deny
+outputs:
+  receipt:
+    type: artifact
+
