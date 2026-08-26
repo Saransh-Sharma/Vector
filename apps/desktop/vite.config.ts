@@ -1,5 +1,5 @@
-import { execFile } from "node:child_process";
-import { existsSync } from "node:fs";
+import { execFile, spawn } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -18,6 +18,57 @@ type InitializeInput = {
   computerUse: boolean;
   harness: "pi" | "omp" | "deepseek";
 };
+
+type VectorOperation = {
+  action: "preflight" | "install" | "smoke" | "computer" | "start" | "prompt" | "abort" | "stop" | "events";
+  workspace?: string;
+  profile?: string;
+  harness?: "pi" | "omp" | "deepseek";
+  surface?: "integrated" | "native";
+  grantYolo?: boolean;
+  prompt?: string;
+  runId?: string;
+  afterSequence?: number;
+  visionModel?: string;
+  requestPermissions?: boolean;
+};
+
+async function runVector(args: string[], timeout = 120_000): Promise<unknown> {
+  const { stdout } = await execFileAsync("cargo", ["run", "-q", "-p", "vector-agent", "--", "--workspace", previewWorkspace, "--json", ...args], {
+    cwd: sourceRoot,
+    timeout,
+    maxBuffer: 8 * 1024 * 1024,
+  });
+  return JSON.parse(stdout);
+}
+
+let daemonStarting: Promise<void> | undefined;
+async function ensurePreviewDaemon(): Promise<void> {
+  if (daemonStarting) return daemonStarting;
+  daemonStarting = (async () => {
+    try {
+      await runVector(["status"], 10_000);
+      return;
+    } catch { /* launch below */ }
+    const child = spawn("cargo", ["run", "-q", "-p", "vectord"], { cwd: sourceRoot, detached: true, stdio: "ignore" });
+    child.unref();
+    for (let attempt = 0; attempt < 80; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      try {
+        await runVector(["status"], 10_000);
+        return;
+      } catch { /* wait for compilation and socket */ }
+    }
+    throw new Error("vectord did not become ready within 20 seconds.");
+  })().finally(() => { daemonStarting = undefined; });
+  return daemonStarting;
+}
+
+function validOperation(value: unknown): value is VectorOperation {
+  if (!value || typeof value !== "object") return false;
+  const action = (value as Record<string, unknown>).action;
+  return typeof action === "string" && ["preflight", "install", "smoke", "computer", "start", "prompt", "abort", "stop", "events"].includes(action);
+}
 
 function json(response: import("node:http").ServerResponse, status: number, value: unknown): void {
   response.statusCode = status;
@@ -114,6 +165,11 @@ function vectorPreviewBridge(): Plugin {
         const executable = process.platform === "win32" ? ".exe" : "";
         const pathEntries = (process.env.PATH ?? "").split(delimiter);
         const hasTool = (name: string) => pathEntries.some((path) => existsSync(join(path, `${name}${executable}`)));
+        const configPath = join(previewWorkspace, ".vector", "vector.yaml");
+        const configured = existsSync(configPath);
+        const defaultProfile = configured
+          ? readFileSync(configPath, "utf8").match(/^defaultProfile:\s*([^\s#]+)/m)?.[1]
+          : undefined;
         json(response, 200, {
           os: process.platform,
           architecture: process.arch,
@@ -121,6 +177,8 @@ function vectorPreviewBridge(): Plugin {
           telemetry: false,
           updateChecks: false,
           tools: Object.fromEntries(["git", "bun", "node", "omp", "pi", "npx"].map((tool) => [tool, hasTool(tool)])),
+          configured,
+          defaultProfile,
         });
       });
 
@@ -145,6 +203,69 @@ function vectorPreviewBridge(): Plugin {
           json(response, 200, { path: result.path, defaultProfile: result.defaultProfile });
         } catch (error) {
           json(response, 500, { error: error instanceof Error ? error.message : String(error) });
+        }
+      });
+
+      server.middlewares.use("/__vector/api", async (request, response) => {
+        if (request.method !== "POST") return json(response, 405, { error: "Method not allowed" });
+        try {
+          const operation = await readJson(request);
+          if (!validOperation(operation)) return json(response, 400, { error: "Invalid Vector operation." });
+          const profile = operation.profile ?? "pi-safe";
+          let result: unknown;
+          switch (operation.action) {
+            case "preflight":
+              result = await runVector(["onboarding", "preflight", "--profile", profile]);
+              break;
+            case "install":
+              if (!operation.harness) throw new Error("Harness is required.");
+              result = await runVector(["harness", "install", operation.harness], 10 * 60_000);
+              break;
+            case "smoke":
+              result = await runVector(["onboarding", "smoke", "--profile", profile], 3 * 60_000);
+              break;
+            case "computer":
+              await ensurePreviewDaemon();
+              if (!operation.visionModel) throw new Error("A vision-role model is required.");
+              result = await runVector([
+                "onboarding", "computer", "--profile", profile,
+                "--vision-model", operation.visionModel,
+                ...(operation.requestPermissions ? ["--request-permissions"] : []),
+              ], 3 * 60_000);
+              break;
+            case "start": {
+              await ensurePreviewDaemon();
+              const args = ["start", "--profile", profile, "--surface", operation.surface ?? "integrated"];
+              if (operation.prompt) args.push("--prompt", operation.prompt);
+              if (operation.grantYolo) args.push("--grant-yolo", "--confirm-yolo", "VECTOR-YOLO");
+              result = await runVector(args);
+              break;
+            }
+            case "prompt":
+              await ensurePreviewDaemon();
+              if (!operation.runId || !operation.prompt) throw new Error("Run ID and prompt are required.");
+              result = await runVector(["prompt", operation.runId, operation.prompt]);
+              break;
+            case "abort":
+              await ensurePreviewDaemon();
+              if (!operation.runId) throw new Error("Run ID is required.");
+              result = await runVector(["abort", operation.runId]);
+              break;
+            case "stop":
+              await ensurePreviewDaemon();
+              if (!operation.runId) throw new Error("Run ID is required.");
+              result = await runVector(["stop", operation.runId]);
+              break;
+            case "events":
+              await ensurePreviewDaemon();
+              if (!operation.runId) throw new Error("Run ID is required.");
+              result = await runVector(["events", operation.runId, "--after", String(operation.afterSequence ?? 0)]);
+              break;
+          }
+          json(response, 200, result);
+        } catch (error) {
+          const detail = error instanceof Error ? error.message : String(error);
+          json(response, 500, { error: detail });
         }
       });
     },

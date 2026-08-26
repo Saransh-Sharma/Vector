@@ -1,13 +1,31 @@
 //! Harness adapters compile a portable spec into an inspectable native plan.
 
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    ffi::OsString,
+    path::{Path, PathBuf},
+    process::Stdio,
+};
 
 use async_trait::async_trait;
+use flate2::read::GzDecoder;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest, Sha256};
+use tar::Archive;
 use thiserror::Error;
+use tokio::process::Command;
 use vector_core::capabilities::*;
 use vector_core::*;
+
+pub const OMP_PACKAGE: &str = "@oh-my-pi/pi-coding-agent";
+pub const OMP_VERSION: &str = "18.0.4";
+pub const OMP_INTEGRITY: &str = "sha512-vi2vZGsZ/OigD3f8M+Qixreuk7afU5P6Qe2JlcW6nTWOC48zYXeY4QZGPsM3R0Ata4xPGNWDtCKCgKjx6KO00A==";
+pub const PI_PACKAGE: &str = "@earendil-works/pi-coding-agent";
+pub const PI_VERSION: &str = "0.84.3";
+pub const PI_INTEGRITY: &str = "sha512-Yr2p9PubrbFZmYEPYI+C8KmZP9xlFuLDnAG64RtU0ZDgrdiXYWa+y7WGyJO5OlqPliOkVCMd9IzVszO3/t0D0w==";
+pub const BUN_VERSION: &str = "1.3.14";
+pub const NODE_VERSION: &str = "22.19.0";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -56,16 +74,17 @@ pub trait HarnessAdapter: Send + Sync {
     fn compile(&self, spec: &PortableRunSpec) -> Result<NativeRunPlan, HarnessError>;
 
     async fn doctor(&self) -> DoctorReport {
-        let executable = self.executable().to_string();
+        let record = inspect_harness(self.id()).await;
         DoctorReport {
             harness: self.id(),
-            detected: executable_on_path(&executable),
-            executable,
-            compatibility: match self.id() {
-                HarnessId::Deepseek => CompatibilityState::ManagedExperimental,
-                _ => CompatibilityState::ManagedTested,
-            },
-            notes: vec![format!("managed package pin: {}", self.package_pin())],
+            detected: record.source != InstallationSource::Missing,
+            executable: record
+                .executable
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| self.executable().to_string()),
+            compatibility: record.compatibility,
+            notes: record.notes,
         }
     }
 
@@ -78,6 +97,57 @@ pub fn adapter(harness: HarnessId) -> Box<dyn HarnessAdapter> {
         HarnessId::Pi => Box::new(PiAdapter),
         HarnessId::Deepseek => Box::new(DeepseekAdapter),
     }
+}
+
+pub fn compile_for_surface(
+    spec: &PortableRunSpec,
+    surface: LaunchSurface,
+) -> Result<NativeRunPlan, HarnessError> {
+    let mut plan = adapter(spec.harness.harness).compile(spec)?;
+    if surface == LaunchSurface::Native {
+        match spec.harness.harness {
+            HarnessId::Omp => {
+                plan.argv = vec![
+                    "launch".into(),
+                    "--config".into(),
+                    "${VECTOR_OVERLAY}/omp/config.yml".into(),
+                    "--cwd".into(),
+                    spec.workspace.root.display().to_string(),
+                    "--model".into(),
+                    format!("lm-studio/{}", spec.models.primary),
+                    "--session-dir".into(),
+                    "${VECTOR_RUN_DIR}/native/omp-sessions".into(),
+                ];
+                if spec.grant.yolo {
+                    plan.argv.push("--yolo".into());
+                } else {
+                    plan.argv
+                        .extend(["--approval-mode".into(), "always-ask".into()]);
+                }
+                plan.observation = "External OMP terminal; Vector records process and native session metadata only".into();
+                plan.native_summary = format!(
+                    "OMP native terminal {} with {}",
+                    if spec.grant.yolo { "YOLO" } else { "guarded" },
+                    spec.models.primary
+                );
+            }
+            HarnessId::Pi => {
+                if plan.argv.get(0).map(String::as_str) == Some("--mode") {
+                    plan.argv.drain(0..2);
+                }
+                plan.observation =
+                    "External Pi terminal; Vector records process and native session metadata only"
+                        .into();
+                plan.native_summary = format!(
+                    "Pi native terminal {} through vector-local/{}",
+                    if spec.grant.yolo { "YOLO" } else { "guarded" },
+                    spec.models.primary
+                );
+            }
+            HarnessId::Deepseek => {}
+        }
+    }
+    Ok(plan)
 }
 
 pub struct OmpAdapter;
@@ -148,31 +218,77 @@ impl HarnessAdapter for OmpAdapter {
         let approval = tool_policy(spec);
         let config = serde_yaml::to_string(&json!({
             "tools": {
-                "approvalMode": if spec.grant.yolo { "yolo" } else { "confirm" },
-                "approval": approval,
+                "approvalMode": if spec.grant.yolo { "yolo" } else { "always-ask" },
             },
-            "model": { "provider": "openai", "id": spec.models.primary },
-            "vector": { "runId": spec.run_id, "runSpecFingerprint": spec.fingerprint()? }
+            "skills": { "enableSkillCommands": false },
+            "extensions": [],
         }))?;
-        let mut argv = vec![
-            "acp".into(),
-            "--config".into(),
-            "${VECTOR_OVERLAY}/omp/config.yml".into(),
-        ];
-        if spec.grant.yolo {
-            argv.push("--yolo".into());
-        }
+        let models = serde_yaml::to_string(&json!({
+            "providers": {
+                "lm-studio": {
+                    "baseUrl": spec.provider.base_url,
+                    "api": "openai-completions",
+                    "auth": "none",
+                    "models": [{
+                        "id": spec.models.primary,
+                        "name": spec.models.primary,
+                        "reasoning": true,
+                        "input": if spec.models.vision.is_some() { vec!["text", "image"] } else { vec!["text"] },
+                        "supportsTools": true,
+                        "contextWindow": spec.context.max_tokens.unwrap_or(32_768),
+                        "maxTokens": 8_192,
+                    }]
+                }
+            }
+        }))?;
+        // OMP's ACP entry point accepts no launch flags. Model selection and
+        // approvals are negotiated over ACP; the overlay remains ledgered as
+        // the auditable policy input for that negotiation.
+        let argv = vec!["acp".into()];
         Ok(NativeRunPlan {
             harness: self.id(),
             executable: self.executable().into(),
             argv,
-            environment: provider_environment(spec),
+            environment: BTreeMap::from([
+                (
+                    "LM_STUDIO_BASE_URL".into(),
+                    EnvironmentValue::Literal(spec.provider.base_url.clone()),
+                ),
+                (
+                    "PI_CODING_AGENT_DIR".into(),
+                    EnvironmentValue::Literal("${VECTOR_OVERLAY}/omp/agent".into()),
+                ),
+                (
+                    "PI_CONFIG_FILES".into(),
+                    EnvironmentValue::Literal("${VECTOR_OVERLAY}/omp/config.yml".into()),
+                ),
+                (
+                    "OTEL_SDK_DISABLED".into(),
+                    EnvironmentValue::Literal("true".into()),
+                ),
+            ]),
             cwd: spec.workspace.root.display().to_string(),
-            generated_files: vec![GeneratedFile {
-                relative_path: "omp/config.yml".into(),
-                content: config,
-                sensitive: false,
-            }],
+            generated_files: vec![
+                GeneratedFile {
+                    relative_path: "omp/config.yml".into(),
+                    content: config,
+                    sensitive: false,
+                },
+                GeneratedFile {
+                    relative_path: "omp/agent/models.yml".into(),
+                    content: models,
+                    sensitive: false,
+                },
+                GeneratedFile {
+                    relative_path: "omp/vector-policy.json".into(),
+                    content: serde_json::to_string_pretty(&json!({
+                        "runId": spec.run_id,
+                        "runSpecFingerprint": spec.fingerprint()?,
+                        "capabilities": approval,
+                    }))?,
+                    sensitive: false,
+                },
+            ],
             observation: "ACP structured events and permission requests".into(),
             cleanup: vec!["remove run-scoped overlay".into()],
             native_summary: format!(
@@ -258,7 +374,11 @@ export default function vectorProvider(pi: ExtensionAPI) {{
     baseUrl: {base_url:?},
     api: "openai-completions",
     apiKey: "vector-local",
-    models: [{{ id: {model:?}, name: {model:?}, input: {input}, reasoning: true }}]
+    models: [{{
+      id: {model:?}, name: {model:?}, input: {input}, reasoning: true,
+      cost: {{ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }},
+      contextWindow: 32768, maxTokens: 8192
+    }}]
   }});
 }}
 "#,
@@ -297,7 +417,16 @@ export default function vectorProvider(pi: ExtensionAPI) {{
             harness: self.id(),
             executable: self.executable().into(),
             argv,
-            environment: BTreeMap::new(),
+            environment: BTreeMap::from([
+                (
+                    "PI_CODING_AGENT_DIR".into(),
+                    EnvironmentValue::Literal("${VECTOR_OVERLAY}/pi/agent".into()),
+                ),
+                (
+                    "PI_SKIP_VERSION_CHECK".into(),
+                    EnvironmentValue::Literal("1".into()),
+                ),
+            ]),
             cwd: spec.workspace.root.display().to_string(),
             generated_files: vec![
                 GeneratedFile {
@@ -499,14 +628,466 @@ fn provider_environment(spec: &PortableRunSpec) -> BTreeMap<String, EnvironmentV
     env
 }
 
-fn executable_on_path(executable: &str) -> bool {
-    let Some(paths) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&paths).any(|path| {
-        let candidate = path.join(executable);
-        candidate.is_file() || cfg!(windows) && path.join(format!("{executable}.exe")).is_file()
+fn expected(harness: HarnessId) -> (&'static str, &'static str, &'static str, &'static str) {
+    match harness {
+        HarnessId::Omp => (OMP_PACKAGE, OMP_VERSION, OMP_INTEGRITY, "bun@1.3.14"),
+        HarnessId::Pi => (PI_PACKAGE, PI_VERSION, PI_INTEGRITY, "node@22.19.0"),
+        HarnessId::Deepseek => (
+            "@deepseek-ai/dsh",
+            "0.1.1-rc.2",
+            "preview-lock-required",
+            "node@22.19.0+pnpm@11.7.0",
+        ),
+    }
+}
+
+fn managed_harness_root(harness: HarnessId) -> Option<PathBuf> {
+    let paths = application_paths()?;
+    let (_, version, _, _) = expected(harness);
+    Some(
+        paths
+            .data_dir
+            .join("runtimes/harnesses")
+            .join(harness.to_string())
+            .join(version),
+    )
+}
+
+fn managed_runtime_executable(harness: HarnessId) -> Option<PathBuf> {
+    let paths = application_paths()?;
+    match harness {
+        HarnessId::Omp => Some(
+            paths
+                .data_dir
+                .join("runtimes/bun")
+                .join(BUN_VERSION)
+                .join("bin/bun"),
+        ),
+        HarnessId::Pi | HarnessId::Deepseek => Some(
+            paths
+                .data_dir
+                .join("runtimes/node")
+                .join(NODE_VERSION)
+                .join(if cfg!(windows) {
+                    "node.exe"
+                } else {
+                    "bin/node"
+                }),
+        ),
+    }
+}
+
+fn package_root(root: &Path, package: &str) -> PathBuf {
+    let mut path = root.join("node_modules");
+    for segment in package.split('/') {
+        path.push(segment);
+    }
+    path
+}
+
+fn managed_record(harness: HarnessId) -> Option<HarnessInstallationRecord> {
+    let root = managed_harness_root(harness)?;
+    let runtime_executable = managed_runtime_executable(harness)?;
+    let (package, version, integrity, runtime) = expected(harness);
+    let package_root = package_root(&root, package);
+    let executable = root.join("node_modules/.bin").join(match harness {
+        HarnessId::Omp => "omp",
+        HarnessId::Pi => "pi",
+        HarnessId::Deepseek => "dsh",
+    });
+    let installed = read_package_identity(&package_root.join("package.json"));
+    let manifest_valid = std::fs::read(root.join("installation.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .is_some_and(|manifest| {
+            manifest.get("package").and_then(serde_json::Value::as_str) == Some(package)
+                && manifest.get("version").and_then(serde_json::Value::as_str) == Some(version)
+                && manifest
+                    .get("integrity")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(integrity)
+        });
+    if !runtime_executable.is_file()
+        || !manifest_valid
+        || installed.as_ref().map(|value| value.0.as_str()) != Some(package)
+        || installed.as_ref().map(|value| value.1.as_str()) != Some(version)
+    {
+        return None;
+    }
+    Some(HarnessInstallationRecord {
+        harness,
+        source: InstallationSource::Managed,
+        executable: Some(executable),
+        runtime_executable: Some(runtime_executable),
+        package_root: Some(package_root),
+        package: Some(package.into()),
+        version: Some(version.into()),
+        integrity: Some(integrity.into()),
+        runtime: runtime.into(),
+        compatibility: if harness == HarnessId::Deepseek {
+            CompatibilityState::ManagedExperimental
+        } else {
+            CompatibilityState::ManagedTested
+        },
+        ready: true,
+        notes: vec![format!("Vector-managed exact pin {package}@{version}")],
     })
+}
+
+pub async fn inspect_harness(harness: HarnessId) -> HarnessInstallationRecord {
+    if let Some(record) = managed_record(harness) {
+        return record;
+    }
+    let (expected_package, expected_version, _, runtime) = expected(harness);
+    let executable_name = match harness {
+        HarnessId::Omp => "omp",
+        HarnessId::Pi => "pi",
+        HarnessId::Deepseek => "dsh",
+    };
+    if let Some(executable) = find_executable(executable_name) {
+        let canonical = std::fs::canonicalize(&executable).unwrap_or(executable.clone());
+        let identity = find_package_identity(&canonical);
+        let exact = identity.as_ref().is_some_and(|(package, version, _)| {
+            package == expected_package && version == expected_version
+        });
+        let (package, version, package_root) = identity
+            .map(|(package, version, root)| (Some(package), Some(version), Some(root)))
+            .unwrap_or_default();
+        return HarnessInstallationRecord {
+            harness,
+            source: InstallationSource::External,
+            executable: Some(executable),
+            runtime_executable: None,
+            package_root,
+            package: package.clone(),
+            version: version.clone(),
+            integrity: None,
+            runtime: runtime.into(),
+            compatibility: if exact {
+                CompatibilityState::ExternalCompatible
+            } else {
+                CompatibilityState::ExternalUnverified
+            },
+            ready: exact,
+            notes: vec![if exact {
+                format!("External installation matches {expected_package}@{expected_version}")
+            } else {
+                format!(
+                    "External executable is {}@{}; Vector requires {expected_package}@{expected_version}",
+                    package.as_deref().unwrap_or("unknown"),
+                    version.as_deref().unwrap_or("unknown")
+                )
+            }],
+        };
+    }
+    HarnessInstallationRecord {
+        harness,
+        source: InstallationSource::Missing,
+        executable: None,
+        runtime_executable: None,
+        package_root: None,
+        package: None,
+        version: None,
+        integrity: None,
+        runtime: runtime.into(),
+        compatibility: CompatibilityState::ExternalIncompatible,
+        ready: false,
+        notes: vec![format!(
+            "No verified executable found; managed pin is {expected_package}@{expected_version}"
+        )],
+    }
+}
+
+pub async fn harness_inventory() -> Vec<HarnessInstallationRecord> {
+    let (omp, pi, deepseek) = tokio::join!(
+        inspect_harness(HarnessId::Omp),
+        inspect_harness(HarnessId::Pi),
+        inspect_harness(HarnessId::Deepseek)
+    );
+    vec![omp, pi, deepseek]
+}
+
+pub async fn install_managed_harness(
+    harness: HarnessId,
+) -> Result<HarnessInstallationRecord, HarnessError> {
+    if harness == HarnessId::Deepseek {
+        return Err(HarnessError::InstallUnsupported(
+            "DeepSeek managed installation remains preview-gated".into(),
+        ));
+    }
+    if let Some(record) = managed_record(harness) {
+        return Ok(record);
+    }
+    let install_root = managed_harness_root(harness).ok_or_else(|| {
+        HarnessError::InstallFailed("Vector application directory is unavailable".into())
+    })?;
+    tokio::fs::create_dir_all(&install_root).await?;
+    let (package, version, integrity, _) = expected(harness);
+    match harness {
+        HarnessId::Omp => {
+            let bun = ensure_managed_bun().await?;
+            run_install(
+                &bun,
+                &["add", "--exact", &format!("{package}@{version}")],
+                &install_root,
+                None,
+            )
+            .await?;
+        }
+        HarnessId::Pi => {
+            let node = ensure_managed_node().await?;
+            let npm = node
+                .parent()
+                .unwrap_or(Path::new("."))
+                .join(if cfg!(windows) { "npm.cmd" } else { "npm" });
+            let mut path = OsString::from(node.parent().unwrap_or(Path::new(".")).as_os_str());
+            if let Some(existing) = std::env::var_os("PATH") {
+                path.push(if cfg!(windows) { ";" } else { ":" });
+                path.push(existing);
+            }
+            run_install(
+                &npm,
+                &[
+                    "install",
+                    "--save-exact",
+                    "--prefix",
+                    install_root.to_string_lossy().as_ref(),
+                    &format!("{package}@{version}"),
+                ],
+                &install_root,
+                Some(path),
+            )
+            .await?;
+        }
+        HarnessId::Deepseek => unreachable!(),
+    }
+    let manifest = json!({
+        "harness": harness,
+        "package": package,
+        "version": version,
+        "integrity": integrity,
+        "installedAt": chrono_like_now(),
+    });
+    tokio::fs::write(
+        install_root.join("installation.json"),
+        serde_json::to_vec_pretty(&manifest)?,
+    )
+    .await?;
+    managed_record(harness).ok_or_else(|| {
+        HarnessError::InstallFailed("installed files did not pass exact-pin validation".into())
+    })
+}
+
+pub fn bind_installation(
+    plan: &mut NativeRunPlan,
+    installation: &HarnessInstallationRecord,
+) -> Result<(), HarnessError> {
+    if !installation.ready {
+        return Err(HarnessError::InstallationUnverified(
+            installation.notes.join("; "),
+        ));
+    }
+    match installation.source {
+        InstallationSource::Managed => {
+            let runtime = installation.runtime_executable.as_ref().ok_or_else(|| {
+                HarnessError::InstallFailed("managed runtime executable is missing".into())
+            })?;
+            let package_root = installation.package_root.as_ref().ok_or_else(|| {
+                HarnessError::InstallFailed("managed package root is missing".into())
+            })?;
+            let cli = match installation.harness {
+                HarnessId::Omp => package_root.join("dist/cli.js"),
+                HarnessId::Pi => package_root.join("dist/bundle/cli.js"),
+                HarnessId::Deepseek => package_root.join("dist/cli.js"),
+            };
+            plan.executable = runtime.display().to_string();
+            plan.argv.insert(0, cli.display().to_string());
+        }
+        InstallationSource::External => {
+            plan.executable = installation
+                .executable
+                .as_ref()
+                .ok_or_else(|| HarnessError::InstallationUnverified("missing executable".into()))?
+                .display()
+                .to_string();
+        }
+        InstallationSource::Missing => {
+            return Err(HarnessError::InstallationUnverified(
+                "harness is not installed".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn ensure_managed_bun() -> Result<PathBuf, HarnessError> {
+    let destination = managed_runtime_executable(HarnessId::Omp).ok_or_else(|| {
+        HarnessError::InstallFailed("Vector application directory is unavailable".into())
+    })?;
+    if command_version(&destination).await.as_deref() == Some(BUN_VERSION) {
+        return Ok(destination);
+    }
+    let source = find_executable("bun")
+        .ok_or_else(|| HarnessError::InstallFailed("Bun 1.3.14 is not installed".into()))?;
+    if command_version(&source).await.as_deref() != Some(BUN_VERSION) {
+        return Err(HarnessError::InstallFailed(format!(
+            "managed OMP requires Bun {BUN_VERSION}"
+        )));
+    }
+    if let Some(parent) = destination.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    tokio::fs::copy(source, &destination).await?;
+    Ok(destination)
+}
+
+async fn ensure_managed_node() -> Result<PathBuf, HarnessError> {
+    let destination = managed_runtime_executable(HarnessId::Pi).ok_or_else(|| {
+        HarnessError::InstallFailed("Vector application directory is unavailable".into())
+    })?;
+    if command_version(&destination).await.as_deref() == Some(&format!("v{NODE_VERSION}")) {
+        return Ok(destination);
+    }
+    #[cfg(windows)]
+    return Err(HarnessError::InstallUnsupported(
+        "managed Node extraction on Windows is not enabled yet".into(),
+    ));
+    #[cfg(not(windows))]
+    {
+        let platform = match (std::env::consts::OS, std::env::consts::ARCH) {
+            ("macos", "aarch64") => "darwin-arm64",
+            ("macos", "x86_64") => "darwin-x64",
+            ("linux", "aarch64") => "linux-arm64",
+            ("linux", "x86_64") => "linux-x64",
+            (os, arch) => {
+                return Err(HarnessError::InstallUnsupported(format!(
+                    "Node {NODE_VERSION} is not packaged for {os}/{arch}"
+                )));
+            }
+        };
+        let archive_name = format!("node-v{NODE_VERSION}-{platform}.tar.gz");
+        let base = format!("https://nodejs.org/dist/v{NODE_VERSION}");
+        let client = reqwest::Client::builder().build()?;
+        let checksums = client
+            .get(format!("{base}/SHASUMS256.txt"))
+            .send()
+            .await?
+            .error_for_status()?
+            .text()
+            .await?;
+        let expected_checksum = checksums
+            .lines()
+            .find_map(|line| {
+                let (checksum, name) = line.split_once("  ")?;
+                (name == archive_name).then(|| checksum.to_string())
+            })
+            .ok_or_else(|| HarnessError::InstallFailed("Node checksum is missing".into()))?;
+        let bytes = client
+            .get(format!("{base}/{archive_name}"))
+            .send()
+            .await?
+            .error_for_status()?
+            .bytes()
+            .await?;
+        let actual = format!("{:x}", Sha256::digest(&bytes));
+        if actual != expected_checksum {
+            return Err(HarnessError::InstallFailed(
+                "Node archive checksum did not match".into(),
+            ));
+        }
+        let runtime_root = destination
+            .parent()
+            .and_then(Path::parent)
+            .ok_or_else(|| HarnessError::InstallFailed("invalid runtime path".into()))?
+            .to_path_buf();
+        let parent = runtime_root
+            .parent()
+            .ok_or_else(|| HarnessError::InstallFailed("invalid runtime parent".into()))?;
+        tokio::fs::create_dir_all(parent).await?;
+        let temp = tempfile::Builder::new()
+            .prefix("node-install-")
+            .tempdir_in(parent)?;
+        let temp_path = temp.path().to_path_buf();
+        let bytes = bytes.to_vec();
+        tokio::task::spawn_blocking(move || -> Result<(), HarnessError> {
+            Archive::new(GzDecoder::new(bytes.as_slice())).unpack(&temp_path)?;
+            Ok(())
+        })
+        .await
+        .map_err(|error| HarnessError::InstallFailed(error.to_string()))??;
+        let extracted = temp.path().join(format!("node-v{NODE_VERSION}-{platform}"));
+        if runtime_root.exists() {
+            std::fs::remove_dir_all(&runtime_root)?;
+        }
+        std::fs::rename(extracted, &runtime_root)?;
+        Ok(destination)
+    }
+}
+
+async fn run_install(
+    executable: &Path,
+    args: &[&str],
+    cwd: &Path,
+    path: Option<OsString>,
+) -> Result<(), HarnessError> {
+    let mut command = Command::new(executable);
+    command
+        .args(args)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(path) = path {
+        command.env("PATH", path);
+    }
+    let output = command.output().await?;
+    if !output.status.success() {
+        return Err(HarnessError::InstallFailed(
+            String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        ));
+    }
+    Ok(())
+}
+
+async fn command_version(path: &Path) -> Option<String> {
+    let output = Command::new(path).arg("--version").output().await.ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn find_executable(executable: &str) -> Option<PathBuf> {
+    let paths = std::env::var_os("PATH")?;
+    std::env::split_paths(&paths)
+        .map(|path| path.join(executable))
+        .find(|path| path.is_file())
+}
+
+fn read_package_identity(path: &Path) -> Option<(String, String)> {
+    let value: serde_json::Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    Some((
+        value.get("name")?.as_str()?.to_string(),
+        value.get("version")?.as_str()?.to_string(),
+    ))
+}
+
+fn find_package_identity(executable: &Path) -> Option<(String, String, PathBuf)> {
+    let mut current = executable.parent()?;
+    loop {
+        let package = current.join("package.json");
+        if let Some((name, version)) = read_package_identity(&package) {
+            return Some((name, version, current.to_path_buf()));
+        }
+        current = current.parent()?;
+    }
+}
+
+fn chrono_like_now() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs().to_string())
+        .unwrap_or_else(|_| "0".into())
 }
 
 #[derive(Debug, Error)]
@@ -532,6 +1113,16 @@ pub enum HarnessError {
     Yaml(#[from] serde_yaml::Error),
     #[error("VCTR_RUN_FAILED: run-spec hashing failed: {0}")]
     Core(#[from] vector_core::CoreError),
+    #[error("VCTR_HARNESS_UNVERIFIED: {0}")]
+    InstallationUnverified(String),
+    #[error("VCTR_RUNTIME_INSTALL_FAILED: {0}")]
+    InstallFailed(String),
+    #[error("VCTR_RUNTIME_UNAVAILABLE: {0}")]
+    InstallUnsupported(String),
+    #[error("VCTR_RUNTIME_INSTALL_FAILED: filesystem operation failed: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("VCTR_RUNTIME_INSTALL_FAILED: download failed: {0}")]
+    Download(#[from] reqwest::Error),
 }
 
 #[cfg(test)]
@@ -571,6 +1162,7 @@ mod tests {
                     base_url: "http://127.0.0.1:1234/v1".into(),
                     secret_ref: None,
                     local: true,
+                    service_fingerprint: None,
                 },
                 models: ModelRoles {
                     primary: "qwen".into(),
@@ -602,7 +1194,8 @@ mod tests {
 
     #[test]
     fn omp_yolo_uses_native_flag() {
-        let plan = OmpAdapter.compile(&sample(HarnessId::Omp, true)).unwrap();
+        let plan =
+            compile_for_surface(&sample(HarnessId::Omp, true), LaunchSurface::Native).unwrap();
         assert!(plan.argv.contains(&"--yolo".to_string()));
     }
 

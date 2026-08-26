@@ -55,6 +55,15 @@ enum JSONValue: Codable {
     var number: Double? { if case .number(let value) = self { value } else { nil } }
 }
 
+final class FixtureTarget: NSObject {
+    var activated = false
+    @objc func activate() { activated = true }
+}
+
+let fixtureTarget = FixtureTarget()
+var fixtureWindow: NSWindow?
+var fixturePoint: CGPoint?
+
 let encoder = JSONEncoder()
 encoder.outputFormatting = [.sortedKeys]
 let decoder = JSONDecoder()
@@ -73,6 +82,7 @@ while let line = readLine() {
     fflush(stdout)
 }
 
+@MainActor
 func handle(_ request: Request) throws -> Response {
     guard request.protocolVersion == "1.0" else { return failure(request, "VCTR_CONFIG_INVALID", "Unsupported computer protocol") }
     guard let expectedGrant, request.grant == expectedGrant else { return failure(request, "VCTR_POLICY_DENIED", "The run-scoped computer grant is missing or invalid") }
@@ -112,13 +122,56 @@ func handle(_ request: Request) throws -> Response {
         CGImageDestinationAddImage(destination, image, nil)
         guard CGImageDestinationFinalize(destination) else { return failure(request, "VCTR_RUN_FAILED", "The screenshot could not be written") }
         return success(request, .object(["path": .string(target.path), "width": .number(Double(image.width)), "height": .number(Double(image.height))]))
+    case "fixture-open":
+        guard trusted(request), CGPreflightScreenCaptureAccess() else { return permissionFailure(request) }
+        guard let path = request.params?["path"]?.string else { return failure(request, "VCTR_CONFIG_INVALID", "fixture-open requires params.path") }
+        let target = URL(fileURLWithPath: path).standardizedFileURL
+        guard let allowedRunRoot, target.path.hasPrefix(allowedRunRoot.path + "/") else { return failure(request, "VCTR_POLICY_DENIED", "Fixture screenshot path must be inside VECTOR_RUN_DIR") }
+
+        fixtureTarget.activated = false
+        let panel = NSPanel(contentRect: NSRect(x: 180, y: 180, width: 420, height: 220), styleMask: [.titled], backing: .buffered, defer: false)
+        panel.title = "Vector computer-use verification"
+        panel.level = .floating
+        let button = NSButton(frame: NSRect(x: 100, y: 72, width: 220, height: 56))
+        button.title = "VECTOR CLICK 7D4E"
+        button.bezelStyle = .rounded
+        button.target = fixtureTarget
+        button.action = #selector(FixtureTarget.activate)
+        panel.contentView?.addSubview(button)
+        panel.makeKeyAndOrderFront(nil)
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        RunLoop.current.run(until: Date().addingTimeInterval(0.35))
+
+        let windowID = CGWindowID(panel.windowNumber)
+        guard let image = CGWindowListCreateImage(.null, .optionIncludingWindow, windowID, [.boundsIgnoreFraming]) else {
+            panel.close()
+            return failure(request, "VCTR_RUN_FAILED", "The verification fixture could not be captured")
+        }
+        try writeImage(image, to: target)
+        let buttonRect = panel.convertToScreen(NSRect(origin: button.frame.origin, size: button.frame.size))
+        let buttonCenter = CGPoint(x: buttonRect.midX, y: buttonRect.midY)
+        let screenHeight = NSScreen.screens.first(where: { $0.frame.contains(buttonCenter) })?.frame.height ?? NSScreen.main?.frame.height ?? 0
+        let point = CGPoint(x: buttonCenter.x, y: screenHeight - buttonCenter.y)
+        fixtureWindow = panel
+        fixturePoint = point
+        return success(request, .object([
+            "path": .string(target.path), "label": .string(button.title),
+            "x": .number(Double(point.x)), "y": .number(Double(point.y)),
+            "width": .number(Double(image.width)), "height": .number(Double(image.height))
+        ]))
     case "click":
         guard trusted(request) else { return permissionFailure(request) }
         guard let x = request.params?["x"]?.number, let y = request.params?["y"]?.number else { return failure(request, "VCTR_CONFIG_INVALID", "click requires numeric x and y") }
         let point = CGPoint(x: x, y: y)
         CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: point, mouseButton: .left)?.post(tap: .cghidEventTap)
         CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: point, mouseButton: .left)?.post(tap: .cghidEventTap)
-        return success(request, .object(["x": .number(x), "y": .number(y)]))
+        RunLoop.current.run(until: Date().addingTimeInterval(0.35))
+        return success(request, .object(["x": .number(x), "y": .number(y), "fixtureActivated": .bool(fixtureTarget.activated)]))
+    case "fixture-close":
+        fixtureWindow?.close()
+        fixtureWindow = nil
+        fixturePoint = nil
+        return success(request, .object(["closed": .bool(true)]))
     case "type":
         guard trusted(request) else { return permissionFailure(request) }
         guard let text = request.params?["text"]?.string else { return failure(request, "VCTR_CONFIG_INVALID", "type requires text") }
@@ -149,6 +202,16 @@ func handle(_ request: Request) throws -> Response {
 }
 
 func trusted(_ request: Request) -> Bool { AXIsProcessTrusted() }
+func writeImage(_ image: CGImage, to target: URL) throws {
+    try FileManager.default.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
+    guard let destination = CGImageDestinationCreateWithURL(target as CFURL, UTType.png.identifier as CFString, 1, nil) else {
+        throw NSError(domain: "VectorComputerHelper", code: 1, userInfo: [NSLocalizedDescriptionKey: "The screenshot destination could not be opened"])
+    }
+    CGImageDestinationAddImage(destination, image, nil)
+    guard CGImageDestinationFinalize(destination) else {
+        throw NSError(domain: "VectorComputerHelper", code: 2, userInfo: [NSLocalizedDescriptionKey: "The screenshot could not be written"])
+    }
+}
 func permissionFailure(_ request: Request) -> Response { failure(request, "VCTR_POLICY_DENIED", "Accessibility permission is required") }
 func success(_ request: Request, _ result: JSONValue) -> Response { Response(id: request.id, ok: true, result: result, error: nil) }
 func failure(_ request: Request, _ code: String, _ message: String) -> Response { Response(id: request.id, ok: false, result: nil, error: HelperError(code: code, message: message)) }

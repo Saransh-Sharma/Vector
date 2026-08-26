@@ -4,6 +4,7 @@ members = [
   "crates/vector-core",
   "crates/vector-config",
   "crates/vector-harness",
+  "crates/vector-runtime",
   "crates/vector-providers",
   "crates/vector-db",
   "crates/vectord",
@@ -21,6 +22,7 @@ rust-version = "1.88"
 [workspace.dependencies]
 anyhow = "1.0"
 async-trait = "0.1"
+base64 = "0.22"
 blake3 = "1.8"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive", "env"] }
@@ -28,13 +30,16 @@ crossterm = "0.29"
 dialoguer = "0.12"
 directories = "6.0"
 futures-util = "0.3"
+flate2 = "1.1"
 ratatui = "0.30"
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls", "stream"] }
 schemars = { version = "1.2", features = ["chrono04", "uuid1"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml = "0.9"
+sha2 = "0.10"
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "chrono", "uuid"] }
+tar = "0.4"
 tempfile = "3.23"
 thiserror = "2.0"
 tokio = { version = "1.48", features = ["full"] }

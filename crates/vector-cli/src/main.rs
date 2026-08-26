@@ -1,7 +1,6 @@
 use std::fs;
 use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -24,12 +23,14 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 use vector_config::{load_workspace, resolve_run, starter_workspace, write_workspace_atomic};
 use vector_core::{
-    HarnessId, PROTOCOL_VERSION, RequestEnvelope, ResponseEnvelope, application_paths,
-    runspec_schema, workspace_schema,
+    HarnessId, LaunchSurface, PROTOCOL_VERSION, RequestEnvelope, ResponseEnvelope,
+    application_paths, runspec_schema, workspace_schema,
 };
-use vector_db::{RunLedger, VectorDatabase};
-use vector_harness::{EnvironmentValue, NativeRunPlan, adapter};
+use vector_db::RunLedger;
+use vector_harness::{NativeRunPlan, adapter};
+use vector_harness::{harness_inventory, install_managed_harness};
 use vector_providers::ProviderDiscovery;
+use vector_runtime::{preflight, smoke_test};
 
 #[derive(Parser)]
 #[command(
@@ -54,6 +55,15 @@ enum Commands {
     Status,
     Resolve(ResolveArgs),
     Run(RunArgs),
+    Start(StartArgs),
+    Prompt(PromptArgs),
+    Abort(SessionArgs),
+    Stop(SessionArgs),
+    Events(EventsArgs),
+    Onboarding {
+        #[command(subcommand)]
+        command: OnboardingCommands,
+    },
     Harness {
         #[command(subcommand)]
         command: HarnessCommands,
@@ -106,10 +116,69 @@ struct RunArgs {
     confirm_yolo: Option<String>,
     #[arg(long)]
     launch: bool,
+    #[arg(long, value_enum, default_value = "integrated")]
+    surface: SurfaceArg,
+}
+
+#[derive(Args)]
+struct StartArgs {
+    #[arg(long)]
+    profile: Option<String>,
+    #[arg(long, value_enum, default_value = "integrated")]
+    surface: SurfaceArg,
+    #[arg(long)]
+    prompt: Option<String>,
+    #[arg(long)]
+    grant_yolo: bool,
+    #[arg(long)]
+    confirm_yolo: Option<String>,
+}
+
+#[derive(Args)]
+struct PromptArgs {
+    run_id: Uuid,
+    message: String,
+}
+
+#[derive(Args)]
+struct SessionArgs {
+    run_id: Uuid,
+}
+
+#[derive(Args)]
+struct EventsArgs {
+    run_id: Uuid,
+    #[arg(long, default_value_t = 0)]
+    after: u64,
+}
+
+#[derive(Subcommand)]
+enum OnboardingCommands {
+    Preflight {
+        #[arg(long)]
+        profile: Option<String>,
+    },
+    Smoke {
+        #[arg(long)]
+        profile: Option<String>,
+    },
+    Computer {
+        #[arg(long)]
+        profile: Option<String>,
+        #[arg(long)]
+        vision_model: String,
+        #[arg(long)]
+        request_permissions: bool,
+    },
 }
 
 #[derive(Subcommand)]
 enum HarnessCommands {
+    Inventory,
+    Install {
+        #[arg(value_enum)]
+        harness: HarnessArg,
+    },
     Plan {
         #[arg(long)]
         profile: Option<String>,
@@ -120,6 +189,21 @@ enum HarnessCommands {
         #[arg(value_enum)]
         harness: HarnessArg,
     },
+}
+
+#[derive(Clone, ValueEnum)]
+enum SurfaceArg {
+    Integrated,
+    Native,
+}
+
+impl From<SurfaceArg> for LaunchSurface {
+    fn from(value: SurfaceArg) -> Self {
+        match value {
+            SurfaceArg::Integrated => Self::Integrated,
+            SurfaceArg::Native => Self::Native,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -173,6 +257,12 @@ async fn main() -> Result<()> {
         Some(Commands::Status) => status(cli.json).await,
         Some(Commands::Resolve(args)) => show_resolve(&root, args, cli.json),
         Some(Commands::Run(args)) => run(&root, args, cli.json).await,
+        Some(Commands::Start(args)) => start(&root, args, cli.json).await,
+        Some(Commands::Prompt(args)) => prompt(args, cli.json).await,
+        Some(Commands::Abort(args)) => session_action("runs.abort", args, cli.json).await,
+        Some(Commands::Stop(args)) => session_action("runs.stop", args, cli.json).await,
+        Some(Commands::Events(args)) => events(args, cli.json).await,
+        Some(Commands::Onboarding { command }) => onboarding(&root, command, cli.json).await,
         Some(Commands::Harness { command }) => harness(&root, command, cli.json).await,
         Some(Commands::Provider { command }) => provider(command, cli.json).await,
         Some(Commands::Workspace { command }) => workspace(&root, command, cli.json),
@@ -227,7 +317,7 @@ async fn init(root: &Path, args: InitArgs, json_output: bool) -> Result<()> {
     }
     let computer = if interactive && !args.computer_use {
         Confirm::with_theme(&ColorfulTheme::default())
-            .with_prompt("Configure computer use now?")
+            .with_prompt("Select a vision role for the separate computer-use verification?")
             .default(false)
             .interact()?
     } else {
@@ -244,7 +334,7 @@ async fn init(root: &Path, args: InitArgs, json_output: bool) -> Result<()> {
             "VCTR_CAPABILITY_UNSATISFIED: computer use needs a model that LM Studio reports as vision-capable, or --vision-model"
         );
     }
-    let mut config = starter_workspace(&model, vision.as_deref(), computer);
+    let mut config = starter_workspace(&model, vision.as_deref(), false);
     let default_profile = match args.harness {
         HarnessArg::Omp => "omp-safe",
         HarnessArg::Pi => "pi-safe",
@@ -252,7 +342,7 @@ async fn init(root: &Path, args: InitArgs, json_output: bool) -> Result<()> {
     };
     config.default_profile = Some(default_profile.into());
     let path = write_workspace_atomic(root, &config)?;
-    let output = json!({"configured":true,"path":path,"provider":lm,"defaultProfile":default_profile,"computerUse":computer});
+    let output = json!({"configured":true,"path":path,"provider":lm,"defaultProfile":default_profile,"computerUse":false,"computerUseVerificationRequested":computer});
     if json_output {
         print_json(output);
     } else {
@@ -333,6 +423,34 @@ fn show_resolve(root: &Path, args: ResolveArgs, json_output: bool) -> Result<()>
 
 async fn harness(root: &Path, command: HarnessCommands, json_output: bool) -> Result<()> {
     match command {
+        HarnessCommands::Inventory => {
+            let inventory = harness_inventory().await;
+            if json_output {
+                print_json(json!(inventory));
+            } else {
+                for record in inventory {
+                    println!(
+                        "{}\t{:?}\t{}\t{}",
+                        record.harness,
+                        record.compatibility,
+                        record.version.unwrap_or_else(|| "missing".into()),
+                        record.notes.join(" ")
+                    );
+                }
+            }
+        }
+        HarnessCommands::Install { harness } => {
+            let record = install_managed_harness(harness.into()).await?;
+            if json_output {
+                print_json(json!(record));
+            } else {
+                println!(
+                    "Installed {} {} in Vector's managed runtime.",
+                    record.harness,
+                    record.version.unwrap_or_default()
+                );
+            }
+        }
         HarnessCommands::Plan {
             profile,
             grant_yolo,
@@ -368,6 +486,112 @@ async fn harness(root: &Path, command: HarnessCommands, json_output: bool) -> Re
                 );
             }
         }
+    }
+    Ok(())
+}
+
+async fn onboarding(root: &Path, command: OnboardingCommands, json_output: bool) -> Result<()> {
+    let resolved = load_workspace(root)?;
+    let profile = match &command {
+        OnboardingCommands::Preflight { profile }
+        | OnboardingCommands::Smoke { profile }
+        | OnboardingCommands::Computer { profile, .. } => profile
+            .clone()
+            .or(resolved.config.default_profile.clone())
+            .context("VCTR_CONFIG_INVALID: no default profile")?,
+    };
+    let value = match command {
+        OnboardingCommands::Preflight { .. } => json!(preflight(root, &profile).await?),
+        OnboardingCommands::Smoke { .. } => json!(smoke_test(root, &profile).await?),
+        OnboardingCommands::Computer {
+            vision_model,
+            request_permissions,
+            ..
+        } => {
+            let response = daemon_request(
+                "onboarding.computer",
+                json!({
+                    "workspace": root, "profile": profile, "visionModel": vision_model,
+                    "requestPermissions": request_permissions,
+                }),
+            )
+            .await?;
+            if !response.ok {
+                bail!(
+                    "{}",
+                    response
+                        .diagnostic
+                        .map(|diagnostic| diagnostic.detail)
+                        .unwrap_or_else(|| "computer-use verification failed".into())
+                );
+            }
+            response.result.unwrap_or(Value::Null)
+        }
+    };
+    if json_output {
+        print_json(value);
+    } else {
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    }
+    Ok(())
+}
+
+async fn start(root: &Path, args: StartArgs, json_output: bool) -> Result<()> {
+    let resolved = load_workspace(root)?;
+    let profile = args
+        .profile
+        .or(resolved.config.default_profile)
+        .context("VCTR_CONFIG_INVALID: no default profile")?;
+    let params = json!({
+        "workspace": root,
+        "profile": profile,
+        "surface": LaunchSurface::from(args.surface),
+        "prompt": args.prompt,
+        "grantYolo": args.grant_yolo,
+        "grantedBy": "cli",
+    });
+    let response = daemon_request_confirmed("runs.start", params, args.confirm_yolo).await?;
+    handle_daemon_response(response, json_output)
+}
+
+async fn prompt(args: PromptArgs, json_output: bool) -> Result<()> {
+    let response = daemon_request(
+        "runs.prompt",
+        json!({"runId":args.run_id,"prompt":args.message}),
+    )
+    .await?;
+    handle_daemon_response(response, json_output)
+}
+
+async fn session_action(method: &str, args: SessionArgs, json_output: bool) -> Result<()> {
+    let response = daemon_request(method, json!({"runId":args.run_id})).await?;
+    handle_daemon_response(response, json_output)
+}
+
+async fn events(args: EventsArgs, json_output: bool) -> Result<()> {
+    let response = daemon_request(
+        "events.snapshot",
+        json!({"runId":args.run_id,"afterSequence":args.after}),
+    )
+    .await?;
+    handle_daemon_response(response, json_output)
+}
+
+fn handle_daemon_response(response: ResponseEnvelope, json_output: bool) -> Result<()> {
+    if !response.ok {
+        bail!(
+            "{}",
+            response
+                .diagnostic
+                .map(|diagnostic| diagnostic.detail)
+                .unwrap_or_else(|| "daemon request failed".into())
+        );
+    }
+    let value = response.result.unwrap_or(Value::Null);
+    if json_output {
+        print_json(value);
+    } else {
+        println!("{}", serde_json::to_string_pretty(&value)?);
     }
     Ok(())
 }
@@ -449,6 +673,24 @@ async fn run(root: &Path, args: RunArgs, json_output: bool) -> Result<()> {
     if args.grant_yolo && args.confirm_yolo.as_deref() != Some("VECTOR-YOLO") {
         bail!("VCTR_POLICY_DENIED: --grant-yolo requires --confirm-yolo VECTOR-YOLO");
     }
+    if args.launch {
+        let resolved = load_workspace(root)?;
+        let profile = args
+            .profile
+            .clone()
+            .or(resolved.config.default_profile)
+            .context("VCTR_CONFIG_INVALID: no default profile")?;
+        let response = daemon_request_confirmed(
+            "runs.start",
+            json!({
+                "workspace": root, "profile": profile, "surface": LaunchSurface::from(args.surface),
+                "grantYolo": args.grant_yolo, "grantedBy": "cli",
+            }),
+            args.confirm_yolo,
+        )
+        .await?;
+        return handle_daemon_response(response, json_output);
+    }
     let spec = resolve_run(root, args.profile.as_deref(), args.grant_yolo)?;
     let plan = adapter(spec.harness.harness).compile(&spec)?;
     let paths = application_paths()
@@ -463,71 +705,17 @@ async fn run(root: &Path, args: RunArgs, json_output: bool) -> Result<()> {
             json!({"plan":plan,"fingerprint":spec.fingerprint()?}),
         )
         .await?;
-    if !args.launch {
-        if json_output {
-            print_json(
-                json!({"runId":spec.run_id,"status":"prepared","directory":ledger.dir,"hint":"Pass --launch to start the native harness"}),
-            );
-        } else {
-            println!(
-                "Prepared run {}\nLedger: {}\nNative launch was not requested. Add --launch after inspecting `vctr harness plan`.",
-                spec.run_id,
-                ledger.dir.display()
-            );
-        }
-        return Ok(());
+    if json_output {
+        print_json(
+            json!({"runId":spec.run_id,"status":"prepared","directory":ledger.dir,"hint":"Pass --launch --surface integrated|native after the coding smoke test"}),
+        );
+    } else {
+        println!(
+            "Prepared run {}\nLedger: {}\nLaunch was not requested. Add `--launch --surface integrated` (or `native`) after the coding smoke test.",
+            spec.run_id,
+            ledger.dir.display()
+        );
     }
-    ledger.set_status("running").await?;
-    let db = VectorDatabase::open(&paths.data_dir.join("state/vector.db")).await?;
-    db.project_run(&ledger.manifest).await?;
-    let mut command = Command::new(&plan.executable);
-    command
-        .args(
-            plan.argv
-                .iter()
-                .map(|arg| substitute(arg, &overlay, &ledger.dir)),
-        )
-        .current_dir(root)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
-    for (name, value) in &plan.environment {
-        match value {
-            EnvironmentValue::Literal(value) => {
-                command.env(name, value);
-            }
-            EnvironmentValue::SecretReference(reference) => bail!(
-                "VCTR_SECRET_UNAVAILABLE: secret materialization is not enabled for {reference}"
-            ),
-        }
-    }
-    let mut child = command.spawn().with_context(|| {
-        format!(
-            "VCTR_HARNESS_INCOMPATIBLE: could not launch {}",
-            plan.executable
-        )
-    })?;
-    ledger
-        .append(
-            "process.started",
-            json!({"pid":child.id(),"executable":plan.executable}),
-        )
-        .await?;
-    let status = child.wait()?;
-    ledger
-        .set_status(if status.success() {
-            "succeeded"
-        } else {
-            "failed"
-        })
-        .await?;
-    ledger
-        .append(
-            "process.exited",
-            json!({"success":status.success(),"code":status.code()}),
-        )
-        .await?;
-    db.project_run(&ledger.manifest).await?;
     Ok(())
 }
 
@@ -578,6 +766,15 @@ async fn status(json_output: bool) -> Result<()> {
 
 #[cfg(unix)]
 async fn daemon_request(method: &str, params: Value) -> Result<ResponseEnvelope> {
+    daemon_request_confirmed(method, params, None).await
+}
+
+#[cfg(unix)]
+async fn daemon_request_confirmed(
+    method: &str,
+    params: Value,
+    confirmation_token: Option<String>,
+) -> Result<ResponseEnvelope> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixStream;
     let paths = application_paths().context("no Vector data directory")?;
@@ -626,7 +823,7 @@ async fn daemon_request(method: &str, params: Value) -> Result<ResponseEnvelope>
         method: method.into(),
         params,
         auth: Some(auth),
-        confirmation_token: None,
+        confirmation_token,
     };
     write
         .write_all(format!("{}\n", serde_json::to_string(&request)?).as_bytes())

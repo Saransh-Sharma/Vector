@@ -27,3 +27,4 @@ vector-core = { path = "../vector-core" }
 vector-db = { path = "../vector-db" }
 vector-harness = { path = "../vector-harness" }
 vector-providers = { path = "../vector-providers" }
+vector-runtime = { path = "../vector-runtime" }

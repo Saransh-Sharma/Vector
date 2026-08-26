@@ -9,6 +9,8 @@
 .env.*
 !.env.example
 .vector/local.yaml
+.vector/onboarding.local.json
+.vector/onboarding.local.tmp
 .vector/generated/
 .vector/runs/
 apps/desktop/dist/

@@ -267,6 +267,7 @@ pub fn resolve_run(
             base_url: provider.base_url.clone(),
             secret_ref: provider.secret_ref.clone(),
             local: provider.local,
+            service_fingerprint: None,
         },
         models: profile.models.clone(),
         capabilities,
@@ -466,7 +467,7 @@ fn whoami() -> String {
 pub fn starter_workspace(
     model: &str,
     vision_model: Option<&str>,
-    enable_computer: bool,
+    _enable_computer: bool,
 ) -> VectorWorkspace {
     let provider = ProviderConfig {
         kind: "lm-studio".into(),
@@ -480,22 +481,8 @@ pub fn starter_workspace(
         ..Default::default()
     };
     let mut policy = BTreeMap::new();
-    policy.insert(
-        Capability::from(COMPUTER_INSPECT),
-        if enable_computer {
-            PolicyDecision::Allow
-        } else {
-            PolicyDecision::Deny
-        },
-    );
-    policy.insert(
-        Capability::from(COMPUTER_CONTROL),
-        if enable_computer {
-            PolicyDecision::Prompt
-        } else {
-            PolicyDecision::Deny
-        },
-    );
+    policy.insert(Capability::from(COMPUTER_INSPECT), PolicyDecision::Deny);
+    policy.insert(Capability::from(COMPUTER_CONTROL), PolicyDecision::Deny);
 
     let packs = vec![
         PackRef {
@@ -639,6 +626,48 @@ pub fn write_workspace_atomic(
     Ok(target)
 }
 
+/// Enables computer use only after the runtime conformance probe has passed.
+/// The change is atomic and applies to the Safe/YOLO pair for the selected
+/// harness so switching launch grants never silently drops the verified role.
+pub fn enable_verified_computer_use(
+    root: &Path,
+    harness: HarnessId,
+    vision_model: &str,
+) -> Result<PathBuf, ConfigError> {
+    let path = root.join(".vector/vector.yaml");
+    let text = fs::read_to_string(&path).map_err(|source| ConfigError::Read {
+        path: path.clone(),
+        source,
+    })?;
+    let mut config: VectorWorkspace = serde_yaml::from_str(&text)?;
+    for profile in config
+        .profiles
+        .values_mut()
+        .filter(|profile| profile.harness == harness)
+    {
+        profile.models.vision = Some(vision_model.to_owned());
+        profile
+            .policy
+            .insert(Capability::from(COMPUTER_INSPECT), PolicyDecision::Allow);
+        profile
+            .policy
+            .insert(Capability::from(COMPUTER_CONTROL), PolicyDecision::Prompt);
+        if !profile
+            .packs
+            .iter()
+            .any(|pack| pack.id == "vector/computer-use")
+        {
+            profile.packs.push(PackRef {
+                id: "vector/computer-use".into(),
+                source: Some("builtin".into()),
+                digest: None,
+                lazy: true,
+            });
+        }
+    }
+    write_workspace_atomic(root, &config)
+}
+
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("VCTR_CONFIG_INVALID: could not read {path}: {source}")]
@@ -758,5 +787,33 @@ mod tests {
             load_workspace(dir.path()).unwrap().config.trust,
             RepositoryTrust::Untrusted
         );
+    }
+
+    #[test]
+    fn computer_use_is_enabled_only_after_verified_atomic_update() {
+        let dir = tempdir().unwrap();
+        let config = starter_workspace("qwen-text", None, false);
+        write_workspace_atomic(dir.path(), &config).unwrap();
+        enable_verified_computer_use(dir.path(), HarnessId::Pi, "qwen-vision").unwrap();
+        let resolved = load_workspace(dir.path()).unwrap();
+        for name in ["pi-safe", "pi-yolo"] {
+            let profile = &resolved.config.profiles[name];
+            assert_eq!(profile.models.vision.as_deref(), Some("qwen-vision"));
+            assert_eq!(
+                profile.policy[&Capability::from(COMPUTER_INSPECT)],
+                PolicyDecision::Allow
+            );
+            assert_eq!(
+                profile.policy[&Capability::from(COMPUTER_CONTROL)],
+                PolicyDecision::Prompt
+            );
+            assert!(
+                profile
+                    .packs
+                    .iter()
+                    .any(|pack| pack.id == "vector/computer-use")
+            );
+        }
+        assert_eq!(resolved.config.profiles["omp-safe"].models.vision, None);
     }
 }

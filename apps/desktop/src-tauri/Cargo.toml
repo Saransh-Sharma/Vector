@@ -9,7 +9,14 @@ repository.workspace = true
 tauri-build = { version = "2.5", features = [] }
 
 [dependencies]
+blake3.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 tauri = { version = "2.9", features = [] }
+tokio.workspace = true
+uuid.workspace = true
 vector-config = { path = "../../../crates/vector-config" }
+vector-core = { path = "../../../crates/vector-core" }
+vector-harness = { path = "../../../crates/vector-harness" }
 vector-providers = { path = "../../../crates/vector-providers" }
+vector-runtime = { path = "../../../crates/vector-runtime" }

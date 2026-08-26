@@ -1,24 +1,25 @@
 [package]
-name = "vectord"
+name = "vector-runtime"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [dependencies]
-anyhow.workspace = true
+base64.workspace = true
 blake3.workspace = true
 chrono.workspace = true
-clap.workspace = true
-directories.workspace = true
+futures-util.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-reqwest.workspace = true
-sqlx.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
 uuid.workspace = true
+vector-config = { path = "../vector-config" }
 vector-core = { path = "../vector-core" }
 vector-db = { path = "../vector-db" }
 vector-harness = { path = "../vector-harness" }
 vector-providers = { path = "../vector-providers" }
-vector-runtime = { path = "../vector-runtime" }
